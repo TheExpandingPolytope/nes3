@@ -20,13 +20,6 @@ import traceback
 import json
 import sqlite3
 from eth_abi import decode_abi, encode_abi
-from shapely.geometry import shape, Point
-import numpy as np
-import cv2
-from Cryptodome.Hash import SHA256
-import base64
-import base58
-from protobuf_models import unixfs_pb2, merkle_dag_pb2
 
 # b'Y\xda*\x98N\x16Z\xe4H|\x99\xe5\xd1\xdc\xa7\xe0L\x8a\x990\x1b\xe6\xbc\t)2\xcb]\x7f\x03Cx'
 ERC20_TRANSFER_HEADER = b'Y\xda*\x98N\x16Z\xe4H|\x99\xe5\xd1\xdc\xa7\xe0L\x8a\x990\x1b\xe6\xbc\t)2\xcb]\x7f\x03Cx'
@@ -48,6 +41,12 @@ logger = logging.getLogger(__name__)
 rollup_server = environ["ROLLUP_HTTP_SERVER_URL"]
 logger.info(f"HTTP rollup_server url is {rollup_server}")
 
+import os
+import subprocess
+import time
+
+
+
 ###
 # Aux Functions 
 
@@ -62,6 +61,12 @@ def str2hex(str):
     Encodes a string as a hex string
     """
     return "0x" + str.encode("utf-8").hex()
+
+def bin2hex(bin):
+    """
+    Encodes a binary string as a hex string
+    """
+    return "0x" + bin.hex()
 
 def send_voucher(voucher):
     send_post("voucher",voucher)
@@ -79,12 +84,6 @@ def send_post(endpoint,json_data):
     response = requests.post(rollup_server + f"/{endpoint}", json=json_data)
     logger.info(f"/{endpoint}: Received response status {response.status_code} body {response.content}")
 
-def check_point_in_fence(fence, latitude, longitude):
-    # shapely
-    fence = json.loads(fence)
-    y = shape(fence)
-    x = Point(longitude, latitude)
-    return y.contains(x)
 
 def process_sql_statement(statement):
     con = sqlite3.connect("data.db")
@@ -95,46 +94,6 @@ def process_sql_statement(statement):
     con.close()
     return result
 
-def process_image(image):
-    b64str = image
-    png = base64.decodebytes(b64str)
-    nparr = np.frombuffer(png,np.uint8)
-    img = cv2.imdecode(nparr,cv2.IMREAD_UNCHANGED)
-    (rows, cols) = img.shape[:2]
-    M = cv2.getRotationMatrix2D((cols / 2, rows / 2), 15, 1)
-    rotated = cv2.warpAffine(img, M, (cols, rows))
-    rotated_png = cv2.imencode('.png',rotated)
-    data_encode = np.array(rotated_png[1])
-    # gaussian = cv2.GaussianBlur(rotated, (9, 9), 0)
-    # gaussian_png = cv2.imencode('.png',gaussian)
-    # data_encode = np.array(gaussian_png[1])
-    byte_encode = data_encode.tobytes()
-    b64out = base64.b64encode(byte_encode)
-    return b64out
-
-def mint_erc721_with_uri_from_image(msg_sender,erc721_to_mint,mint_header,b64out):
-    pngout = base64.decodebytes(b64out)
-
-    unixf = unixfs_pb2.Data()
-    unixf.Type = 2 # file
-    unixf.Data = pngout
-    unixf.filesize = len(unixf.Data)
-
-    mdag = merkle_dag_pb2.MerkleNode()
-    mdag.Data = unixf.SerializeToString()
-
-    data = mdag.SerializeToString()
-
-    h = SHA256.new()
-    h.update(data)
-    sha256_code = "12"
-    size = hex(h.digest_size)[2:]
-    digest = h.hexdigest()
-    combined = f"{sha256_code}{size}{digest}"
-    multihash = base58.b58encode(bytes.fromhex(combined))
-    tokenURI = multihash.decode('utf-8') # it is not the ipfs unixfs 'file' hash
-
-    mint_erc721_with_string(msg_sender,erc721_to_mint,mint_header,tokenURI)
     
 def mint_erc721_with_string(msg_sender,erc721_to_mint,mint_header,string):
     mint_header = clean_header(mint_header)
@@ -172,78 +131,41 @@ def handle_advance(request):
     status = "accept"
     payload = None
     try:
-        payload = hex2str(data["payload"])
-        logger.info(f"Received str {payload}")
-        if payload == "exception":
-            status = "reject"
-            exception = {"payload": str2hex(str(payload))}
-            send_exception(exception)
-            sys.exit(1)
-        elif payload == "reject":
-            status = "reject"
-            report = {"payload": str2hex(str(payload))}
-            send_report(report)
-        elif payload == "report":
-            report = {"payload": str2hex(str(payload))}
-            send_report(report)
-        elif payload[0:7] == "voucher":
-            payload = f"{payload}"
-            voucher = json.loads(payload[7:])
-            send_voucher(voucher)
-        elif payload == "notice":
-            notice = {"payload": str2hex(str(payload))}
-            send_notice(notice)
-        else:
-            try:
-                logger.info(f"Trying to decode json")
-                # try json data
-                json_data = json.loads(payload)
-                # check geo data
-                if json_data.get("fence") and json_data.get("latitude") and json_data.get("longitude"):
-                    latitude = json_data["latitude"]
-                    longitude = json_data["longitude"]
-                    # logger.info(f"Received geo request lat,long({latitude},{longitude})")
-                    # payload = f"{check_point_in_fence(latitude, longitude)}"
-                    fence = json_data["fence"]
-                    logger.info(f"Received geo request fence ({fence}) lat,long({latitude},{longitude})")
-                    payload = f"{check_point_in_fence(fence, latitude, longitude)}"
-                # check sql
-                elif json_data.get("sql"):
-                    sql_statement = json_data["sql"]
-                    logger.info(f"Received sql statement ({sql_statement})")
-                    payload = f"{process_sql_statement(sql_statement)}"
-                elif json_data.get("array"):
-                    logger.info(f"Received array to sort ({json_data['array']})")
-                    a = np.array(json_data["array"])
-                    payload = f"{np.sort(a)}"
-                elif json_data.get("image"):
-                    b64out = process_image(json_data["image"].encode("utf-8"))
-                    payload = f"{b64out}"
-                    if json_data.get("erc721_to_mint") and json_data.get("selector"):
-                        mint_erc721_with_uri_from_image(data["metadata"]["msg_sender"],json_data["erc721_to_mint"],json_data["selector"],b64out)
-                elif json_data.get("erc721_to_mint") and json_data.get("selector"):
-                    logger.info(f"Received mint request to ({json_data['erc721_to_mint']})")
-                    if json_data.get("string"):
-                        mint_erc721_with_string(data["metadata"]["msg_sender"],json_data["erc721_to_mint"],json_data["selector"],json_data["string"])
-                    else:
-                        mint_erc721_no_data(data["metadata"]["msg_sender"],json_data["erc721_to_mint"],json_data["selector"])
-                else:
-                    raise Exception('Not supported json operation')
-            except Exception as e2:
-                msg = f"Not valid json: {e2}"
-                traceback.print_exc()
-                logger.info(msg)
+        payload = data["payload"]
+        #create file from payload with random name
+        binary = bytes.fromhex(payload[2:])
+        file = open("abc.nes", "wb")
+        file.write(binary)
+        file.close()
+        subprocess.run("chmod u+x " + id, shell=True)
+        
+        # Allow clients to connect to the X server
+        os.system("xhost +")
+
+        # Setup virtual framebuffer
+        os.environ['SDL_FBDEV'] = '/dev/fb1'
+        #subprocess.Popen(["Xvfb", ":1", "-screen", "0", "1280x720x24"])
+
+        # Set DISPLAY environment variable
+        os.environ['DISPLAY'] = ':1'
+
+        # Start the game
+        #xvfb-run --listen-tcp --server-num 44 --auth-file /tmp/xvfb.auth -s "-ac -screen 0 1920x1080x24" java -jar selenium.jar
+        os.system("cd ./nesalizer && chmod +x nes && DISPLAY=:1 && xvfb-run -a -s '-ac -screen 0 1280x720x24' ./nes loz.nes &")
+
+        # Wait for the game to start up and become visible on the screen
+        time.sleep(10)
+
+        # Use FFmpeg to record the screen for 20 seconds and encode it as an MP4 video
+        #specify the screen to record
+        subprocess.Popen(["ffmpeg", "-y", "-f", "x11grab", "-s", "1280x720", "-i", ":1", "-t", "20", "output.mp4"])
+        
+
 
     except Exception as e:
-        try:
-            logger.info(f"Trying to decode deposit")
-            handle_tx(data["metadata"]["msg_sender"],data["payload"])
-        except Exception as e2:
-            status = "reject"
-            msg = f"Error executing deposit: {e}"
-            # traceback.print_exc()
-            logger.error(msg)
-            send_report({"payload": str2hex(msg)})
+        logger.info(f"Exception {e}")
+        status = "reject"
+        #payload = str2hex(str(e))
 
     if not payload:
         payload = data["payload"]
@@ -252,7 +174,7 @@ def handle_advance(request):
     notice = {"payload": payload}
     send_notice(notice)
 
-    logger.info(f"Payload is {payload}")
+    #logger.info(f"Payload is {payload}")
     return status
 
 def handle_tx(sender,payload):
@@ -322,7 +244,12 @@ def handle_inspect(request):
     data = request["data"]
     logger.info(f"Received inspect request {data}")
     logger.info("Adding report")
-    report = {"payload": data["payload"]}
+    #return ./placeholder.mp4 within report = {"payload": data["payload"]}
+
+    with open("output.mp4", "rb") as f:
+        payload = f.read()
+        #logger.info(f"payload {bin2hex(payload)}")
+    report = {"payload": bin2hex(payload)}
     send_report(report)
     return "accept"
 
